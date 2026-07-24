@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
@@ -137,6 +138,70 @@ Class08 <--> C2: Cool label`},
 
 		if len(img2) <= len(img1) {
 			t.Errorf("RenderAsScaledPng() expected larger image data for 2.0 scale than 1.0, got %v bytes vs %v bytes", len(img2), len(img1))
+		}
+	})
+
+	t.Run("SequentialDifferentPngs", func(t *testing.T) {
+		content1 := "graph TD; A-->B;"
+		content2 := "sequenceDiagram; Alice->>Bob: Hello John, how are you?; Bob-->>Alice: Fine!"
+		img1, box1, err := re1.RenderAsPng(content1)
+		if err != nil {
+			t.Fatalf("RenderAsPng(content1) error = %v", err)
+		}
+		img2, box2, err := re1.RenderAsPng(content2)
+		if err != nil {
+			t.Fatalf("RenderAsPng(content2) error = %v", err)
+		}
+		// Render content2 again
+		img3, box3, err := re1.RenderAsPng(content2)
+		if err != nil {
+			t.Fatalf("RenderAsPng(content2 second time) error = %v", err)
+		}
+		t.Logf("box1: %#v, box2: %#v, box3: %#v", box1, box2, box3)
+		if string(img2) == string(img1) {
+			t.Errorf("img2 (sequence diagram) was identical to img1 (flowchart) because screenshot was taken before promise resolved!")
+		}
+		if string(img2) != string(img3) {
+			t.Errorf("img2 and img3 should both be sequence diagrams, but img2 was stale!")
+		}
+	})
+
+	t.Run("InvalidSyntaxPng", func(t *testing.T) {
+		content := "graph TD; A---;" // Invalid syntax
+		_, _, err := re1.RenderAsPng(content)
+		if err == nil {
+			t.Error("RenderAsPng() expected error for invalid syntax, but got nil")
+		}
+	})
+
+	t.Run("ConcurrentRenders", func(t *testing.T) {
+		var wg sync.WaitGroup
+		for i := 0; i < 5; i++ {
+			wg.Add(1)
+			go func(n int) {
+				defer wg.Done()
+				content := "graph TD; A-->B;"
+				svg, err := re1.Render(content)
+				if err != nil {
+					t.Errorf("Concurrent Render() error = %v", err)
+				}
+				if !strings.HasPrefix(svg, "<svg") {
+					t.Errorf("Concurrent Render() invalid svg")
+				}
+			}(i)
+		}
+		wg.Wait()
+	})
+
+	t.Run("CancelledContextStartup", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		engine, err := NewRenderEngine(ctx, nil)
+		if err == nil {
+			t.Error("NewRenderEngine() expected error with cancelled context, got nil")
+		}
+		if engine != nil {
+			t.Error("NewRenderEngine() expected nil engine on error, got non-nil")
 		}
 	})
 
