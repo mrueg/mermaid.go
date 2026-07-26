@@ -46,12 +46,16 @@ func NewRenderEngine(ctx context.Context, statements []string, options ...chrome
 
 	args := make([]chromedp.ExecAllocatorOption, 0, len(chromedp.DefaultExecAllocatorOptions)+len(options)+1)
 	args = append(args, chromedp.DefaultExecAllocatorOptions[:]...)
-	args = append(args, options...)
 
 	deadline, ok := ctx.Deadline()
 	if ok {
-		args = append(args, chromedp.WSURLReadTimeout(time.Until(deadline)))
+		timeout := time.Until(deadline)
+		if timeout < 20*time.Second {
+			timeout = 20 * time.Second
+		}
+		args = append(args, chromedp.WSURLReadTimeout(timeout))
 	}
+	args = append(args, options...)
 	actx, allocatorCancel := chromedp.NewExecAllocator(ctx, args...)
 	ctx, cancel := chromedp.NewContext(actx)
 	actions := []chromedp.Action{
