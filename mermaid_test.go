@@ -2,11 +2,14 @@ package mermaid_go
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/chromedp/chromedp"
 )
 
 var renderTimeout = 30 * time.Second
@@ -232,6 +235,91 @@ Class08 <--> C2: Cool label`},
 			if !strings.HasPrefix(got, "<svg") {
 				t.Errorf("Render(%s) got invalid svg", content)
 			}
+		}
+	})
+
+	t.Run("ErrMermaidNotReady", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), renderTimeout)
+		defer cancel()
+		engine, err := NewRenderEngine(ctx, []string{"delete window.mermaid"})
+		if !errors.Is(err, ErrMermaidNotReady) {
+			t.Errorf("NewRenderEngine() expected ErrMermaidNotReady, got %v", err)
+		}
+		if engine != nil {
+			t.Error("NewRenderEngine() expected nil engine on error, got non-nil")
+		}
+	})
+
+	t.Run("ErrFailedEncoding", func(t *testing.T) {
+		oldJSONMarshal := jsonMarshal
+		defer func() { jsonMarshal = oldJSONMarshal }()
+		jsonMarshal = func(v any) ([]byte, error) {
+			return nil, errors.New("mock marshal error")
+		}
+
+		content := "graph TD; A-->B;"
+		_, err := re1.Render(content)
+		if !errors.Is(err, ErrFailedEncoding) {
+			t.Errorf("Render() expected ErrFailedEncoding, got %v", err)
+		}
+
+		_, _, err = re1.RenderAsScaledPng(content, 1.0)
+		if !errors.Is(err, ErrFailedEncoding) {
+			t.Errorf("RenderAsScaledPng() expected ErrFailedEncoding, got %v", err)
+		}
+
+		_, _, err = re1.RenderAsPng(content)
+		if !errors.Is(err, ErrFailedEncoding) {
+			t.Errorf("RenderAsPng() expected ErrFailedEncoding, got %v", err)
+		}
+	})
+
+	t.Run("AllocatorOptions", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), renderTimeout)
+		defer cancel()
+		engine, err := NewRenderEngine(ctx, nil, chromedp.NoSandbox)
+		if err != nil {
+			t.Fatalf("NewRenderEngine() with custom options error = %v", err)
+		}
+		defer engine.Cancel()
+
+		svg, err := engine.Render("graph TD; A-->B;")
+		if err != nil {
+			t.Errorf("Render() error = %v", err)
+		}
+		if !strings.HasPrefix(svg, "<svg") {
+			t.Errorf("Render() invalid svg")
+		}
+	})
+
+	t.Run("MultipleCancel", func(t *testing.T) {
+		ctx, cancel := context.WithTimeout(context.Background(), renderTimeout)
+		defer cancel()
+		engine, err := NewRenderEngine(ctx, nil)
+		if err != nil {
+			t.Fatalf("NewRenderEngine() error = %v", err)
+		}
+		engine.Cancel()
+		// Calling Cancel a second time should be safe and non-panicking
+		engine.Cancel()
+	})
+
+	t.Run("DeadlineContext", func(t *testing.T) {
+		deadline := time.Now().Add(10 * time.Second)
+		ctx, cancel := context.WithDeadline(context.Background(), deadline)
+		defer cancel()
+		engine, err := NewRenderEngine(ctx, nil)
+		if err != nil {
+			t.Fatalf("NewRenderEngine() with deadline error = %v", err)
+		}
+		defer engine.Cancel()
+
+		svg, err := engine.Render("graph TD; A-->B;")
+		if err != nil {
+			t.Errorf("Render() error = %v", err)
+		}
+		if !strings.HasPrefix(svg, "<svg") {
+			t.Errorf("Render() invalid svg")
 		}
 	})
 

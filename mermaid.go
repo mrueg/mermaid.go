@@ -37,6 +37,8 @@ type RenderEngine struct {
 	allocatorCancel context.CancelFunc
 }
 
+var jsonMarshal = json.Marshal
+
 func NewRenderEngine(ctx context.Context, statements []string, options ...chromedp.ExecAllocatorOption) (*RenderEngine, error) {
 	var (
 		result string
@@ -56,11 +58,11 @@ func NewRenderEngine(ctx context.Context, statements []string, options ...chrome
 		chromedp.Navigate(DefaultPage),
 		chromedp.Evaluate(SourceMermaid, nil),
 		chromedp.Evaluate("mermaid.initialize({startOnLoad:false})", nil),
-		chromedp.Evaluate("typeof mermaid", &result),
 	}
 	for _, stmt := range statements {
 		actions = append(actions, chromedp.Evaluate(stmt, nil))
 	}
+	actions = append(actions, chromedp.Evaluate("typeof mermaid", &result))
 	err := chromedp.Run(ctx, actions...)
 	if err == nil && result != "object" {
 		err = ErrMermaidNotReady
@@ -104,7 +106,7 @@ func (r *RenderEngine) Render(content string, opts ...RenderOption) (string, err
 		opt(renderOpts)
 	}
 
-	encodedContent, err := json.Marshal(content)
+	encodedContent, err := jsonMarshal(content)
 	if err != nil {
 		return "", ErrFailedEncoding
 	}
@@ -140,7 +142,7 @@ func (r *RenderEngine) RenderAsScaledPng(content string, scale float64) ([]byte,
 		result_in_bytes []byte
 		model           *dom.BoxModel
 	)
-	encodedContent, err := json.Marshal(content)
+	encodedContent, err := jsonMarshal(content)
 	if err != nil {
 		return nil, nil, ErrFailedEncoding
 	}
