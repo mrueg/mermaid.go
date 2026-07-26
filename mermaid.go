@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 
 	"github.com/chromedp/cdproto/dom"
@@ -30,43 +31,58 @@ var (
 type BoxModel = dom.BoxModel
 
 type RenderEngine struct {
+	mu              sync.Mutex
 	ctx             context.Context
 	cancel          context.CancelFunc
 	allocatorCancel context.CancelFunc
 }
+
+var jsonMarshal = json.Marshal
 
 func NewRenderEngine(ctx context.Context, statements []string, options ...chromedp.ExecAllocatorOption) (*RenderEngine, error) {
 	var (
 		result string
 	)
 
-	args := append(chromedp.DefaultExecAllocatorOptions[:], options...)
+	args := make([]chromedp.ExecAllocatorOption, 0, len(chromedp.DefaultExecAllocatorOptions)+len(options)+1)
+	args = append(args, chromedp.DefaultExecAllocatorOptions[:]...)
 
 	deadline, ok := ctx.Deadline()
 	if ok {
-		args = append(args, chromedp.WSURLReadTimeout(time.Until(deadline)))
+		timeout := time.Until(deadline)
+		if timeout < 20*time.Second {
+			timeout = 20 * time.Second
+		}
+		args = append(args, chromedp.WSURLReadTimeout(timeout))
 	}
-	actx, allocatorCancel := chromedp.NewExecAllocator(ctx,
-		args...)
+	args = append(args, options...)
+	actx, allocatorCancel := chromedp.NewExecAllocator(ctx, args...)
 	ctx, cancel := chromedp.NewContext(actx)
 	actions := []chromedp.Action{
 		chromedp.Navigate(DefaultPage),
 		chromedp.Evaluate(SourceMermaid, nil),
-		chromedp.Evaluate("mermaid.initialize({startOnLoad:true})", nil),
-		chromedp.Evaluate("typeof mermaid", &result),
+		chromedp.Evaluate("mermaid.initialize({startOnLoad:false})", nil),
 	}
 	for _, stmt := range statements {
 		actions = append(actions, chromedp.Evaluate(stmt, nil))
 	}
+	actions = append(actions, chromedp.Evaluate("typeof mermaid", &result))
 	err := chromedp.Run(ctx, actions...)
 	if err == nil && result != "object" {
 		err = ErrMermaidNotReady
+	}
+	if err != nil {
+		cancel()
+		if allocatorCancel != nil {
+			allocatorCancel()
+		}
+		return nil, err
 	}
 	return &RenderEngine{
 		ctx:             ctx,
 		cancel:          cancel,
 		allocatorCancel: allocatorCancel,
-	}, err
+	}, nil
 }
 
 type RenderOption func(*renderOptions)
@@ -82,6 +98,9 @@ func WithBundle() RenderOption {
 }
 
 func (r *RenderEngine) Render(content string, opts ...RenderOption) (string, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	var (
 		result string
 	)
@@ -91,14 +110,14 @@ func (r *RenderEngine) Render(content string, opts ...RenderOption) (string, err
 		opt(renderOpts)
 	}
 
-	encodedContent, err := json.Marshal(content)
+	encodedContent, err := jsonMarshal(content)
 	if err != nil {
 		return "", ErrFailedEncoding
 	}
 
 	var script string
 	if renderOpts.bundle {
-		script = fmt.Sprintf(`mermaid.render('mermaid', %s).then(({ svg }) => {
+		script = fmt.Sprintf(`document.body.innerHTML = ''; mermaid.render('mermaid', %s).then(({ svg }) => {
 			const parser = new DOMParser();
 			const doc = parser.parseFromString(svg, 'image/svg+xml');
 			const svgElem = doc.querySelector('svg');
@@ -108,7 +127,7 @@ func (r *RenderEngine) Render(content string, opts ...RenderOption) (string, err
 			return new XMLSerializer().serializeToString(doc);
 		});`, string(encodedContent), string(encodedContent))
 	} else {
-		script = fmt.Sprintf("mermaid.render('mermaid', %s).then(({ svg }) => { return svg; });", string(encodedContent))
+		script = fmt.Sprintf("document.body.innerHTML = ''; mermaid.render('mermaid', %s).then(({ svg }) => { return svg; });", string(encodedContent))
 	}
 
 	err = chromedp.Run(r.ctx,
@@ -120,16 +139,22 @@ func (r *RenderEngine) Render(content string, opts ...RenderOption) (string, err
 }
 
 func (r *RenderEngine) RenderAsScaledPng(content string, scale float64) ([]byte, *BoxModel, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+
 	var (
 		result_in_bytes []byte
 		model           *dom.BoxModel
 	)
-	encodedContent, err := json.Marshal(content)
+	encodedContent, err := jsonMarshal(content)
 	if err != nil {
 		return nil, nil, ErrFailedEncoding
 	}
+	script := fmt.Sprintf("document.body.innerHTML = ''; mermaid.render('mermaid', %s).then(({ svg }) => { document.body.innerHTML = svg; });", string(encodedContent))
 	err = chromedp.Run(r.ctx,
-		chromedp.Evaluate(fmt.Sprintf("mermaid.render('mermaid', %s).then(({ svg }) => { document.body.innerHTML = svg; });", string(encodedContent)), nil),
+		chromedp.Evaluate(script, nil, func(p *runtime.EvaluateParams) *runtime.EvaluateParams {
+			return p.WithAwaitPromise(true)
+		}),
 		chromedp.ScreenshotScale("#mermaid", scale, &result_in_bytes, chromedp.ByID),
 		chromedp.Dimensions("#mermaid", &model, chromedp.ByID),
 	)
@@ -141,6 +166,8 @@ func (r *RenderEngine) RenderAsPng(content string) ([]byte, *BoxModel, error) {
 }
 
 func (r *RenderEngine) Cancel() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
 	r.cancel()
 	if r.allocatorCancel != nil {
 		r.allocatorCancel()
