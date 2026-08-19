@@ -54,16 +54,37 @@ Initializes a new render engine by launching a headless browser and loading `mer
 - `statements`: Optional JavaScript statements to execute during initialization (e.g., custom mermaid configuration).
 - `options`: Variadic list of `chromedp` allocator options.
 
+If `ctx` has no deadline, loading the bundle and running `statements` is bounded by
+`DefaultStartupTimeout` (60s); pass a context with a deadline to choose your own. Note that
+`chromedp`'s `WSURLReadTimeout` only covers reading the DevTools URL from chrome's stderr, not this
+work. Bear in mind that `ctx` also governs the **engine's whole lifetime**, so for a long-lived
+engine prefer `context.Background()` and let each render carry its own deadline.
+
 ### `Render(content string, opts ...RenderOption) (string, error)`
 Renders a Mermaid diagram source into an SVG string.
-- `WithBundle()`: An option to include the original Mermaid source code within a `<desc>` tag in the generated SVG.
+- `WithBundle()`: An option to include the original Mermaid source code within a `<desc>` tag in the generated SVG. SVG only — passing it to a PNG method returns `ErrUnsupportedOption` rather than being silently ignored.
 - `WithTimeout(d time.Duration)`: An option to override the render deadline for this call. `d <= 0` disables it.
 
 ### `RenderAsPng(content string, opts ...RenderOption) ([]byte, *BoxModel, error)`
-Renders a Mermaid diagram source into a PNG image. Returns the raw PNG bytes and the diagram's bounding box dimensions.
+Renders a Mermaid diagram source into a PNG image. Returns the raw PNG bytes and the diagram's bounding box dimensions. On failure it returns no image and no box model, so a partial screenshot cannot be mistaken for a complete one.
 
 ### `RenderAsScaledPng(content string, scale float64, opts ...RenderOption) ([]byte, *BoxModel, error)`
 Renders a Mermaid diagram into a scaled PNG image. Useful for generating high-resolution outputs.
+
+### `RenderContext`, `RenderAsPngContext`, `RenderAsScaledPngContext`
+Context-aware equivalents of the three methods above, taking `ctx context.Context` as the first
+argument. Use these from a server: the context covers **the wait for other renders as well as the
+render itself**, so an abandoned request stops consuming a slot. Renders are serialised on one
+browser tab, and the render deadline only starts once a render begins, so without a context the
+queueing wait is unbounded no matter how short the timeout.
+
+`ctx`'s deadline applies whenever it is sooner than the engine's render timeout, and its
+cancellation is propagated. Only cancellation and the deadline are taken from `ctx` — its values are
+not, because the render has to run on chromedp's own context.
+
+```go
+svg, err := re.RenderContext(req.Context(), content)
+```
 
 ### `SetRenderTimeout(d time.Duration)`
 Overrides `DefaultRenderTimeout` (30s) for subsequent renders. Every render runs on its own
@@ -88,7 +109,22 @@ target is crashed return the underlying chromedp error joined with this one, so
 clears if chrome reloads the target after the crash.
 
 ### `Cancel()`
-Closes the underlying browser instance and releases all associated resources.
+Closes the underlying browser instance and releases all associated resources. It does not wait for
+an in-flight render: it aborts one, rather than queueing behind it.
+
+## Errors
+
+Failures are classified with sentinel errors so callers can branch with `errors.Is` instead of
+matching on messages — which matters mainly for deciding whether a retry is worthwhile:
+
+| Error | Meaning | Retry? |
+| --- | --- | --- |
+| `ErrRenderException` | The page raised a JavaScript exception; almost always an invalid diagram. The `*runtime.ExceptionDetails` stays reachable via `errors.As` for the script location and stack. | No — it will fail identically |
+| `ErrTargetCrashed` | Chrome died. Joined to the underlying error, and reported to `SetTargetCrashedHandler`. | Yes, on a fresh engine |
+| `context.DeadlineExceeded` | The render, or the wait for a turn, outran its deadline. | Maybe |
+| `ErrUnsupportedOption` | A `RenderOption` the called method cannot honour, e.g. `WithBundle()` on a PNG. | No — fix the call |
+| `ErrFailedEncoding` | The diagram source could not be JSON-encoded. Wraps the underlying error. | No |
+| `ErrMermaidNotReady` | `mermaid.js` did not initialise. The message names what `typeof mermaid` actually was. | No |
 
 ## Example
 
