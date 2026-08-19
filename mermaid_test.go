@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -509,7 +510,19 @@ func TestRenderEngine_TargetCrashed(t *testing.T) {
 	}
 }
 
+// TestRenderEngine_TargetCrashedLive exercises the listener against a real
+// browser. It is opt-in via MERMAID_GO_LIVE_CRASH_TEST because how a renderer
+// crash is reported is not portable: Page.crash reliably kills the renderer
+// everywhere (the command never replies, because the renderer it is addressed
+// to is gone), but the GitHub runner delivers no Inspector.targetCrashed for it
+// within 15s, while a desktop chrome does. TestRenderEngine_TargetCrashed
+// covers the bookkeeping deterministically; this only adds proof that
+// ListenTarget is wired to real chrome events.
 func TestRenderEngine_TargetCrashedLive(t *testing.T) {
+	if os.Getenv("MERMAID_GO_LIVE_CRASH_TEST") == "" {
+		t.Skip("set MERMAID_GO_LIVE_CRASH_TEST=1 to run the live crash test")
+	}
+
 	re, err := NewRenderEngine(context.Background(), nil, chromedp.WSURLReadTimeout(renderTimeout))
 	if err != nil {
 		t.Fatalf("NewRenderEngine() error = %v", err)
