@@ -9,10 +9,13 @@ import (
 	"testing"
 	"time"
 
+	"github.com/chromedp/cdproto/inspector"
 	"github.com/chromedp/chromedp"
 )
 
-var renderTimeout = 30 * time.Second
+// renderTimeout bounds engine startup in the subtests that launch their own
+// browser; chrome plus the 3.5MB mermaid bundle is slow under -race.
+var renderTimeout = 60 * time.Second
 
 func TestRenderEngine_Render(t *testing.T) {
 	cases := []struct {
@@ -99,11 +102,13 @@ Class08 <--> C2: Cool label`},
 	B-->C;`},
 	}
 
-	ctx1, cancel := context.WithTimeout(context.Background(), renderTimeout)
-	defer cancel()
-	re1, err := NewRenderEngine(ctx1, []string{`mermaid.initialize({'theme': 'base', 'themeVariables': { 'primaryColor': '#1473e6'}});`})
+	// The engine outlives the whole suite, so it must not be tied to a
+	// per-render deadline; each render is bounded by DefaultRenderTimeout.
+	re1, err := NewRenderEngine(context.Background(),
+		[]string{`mermaid.initialize({'theme': 'base', 'themeVariables': { 'primaryColor': '#1473e6'}});`},
+		chromedp.WSURLReadTimeout(renderTimeout))
 	if err != nil {
-		t.Errorf("NewRenderEngine() error = %v", err)
+		t.Fatalf("NewRenderEngine() error = %v", err)
 	}
 
 	defer re1.Cancel()
@@ -305,7 +310,7 @@ Class08 <--> C2: Cool label`},
 	})
 
 	t.Run("DeadlineContext", func(t *testing.T) {
-		deadline := time.Now().Add(10 * time.Second)
+		deadline := time.Now().Add(renderTimeout)
 		ctx, cancel := context.WithDeadline(context.Background(), deadline)
 		defer cancel()
 		engine, err := NewRenderEngine(ctx, nil)
@@ -322,7 +327,6 @@ Class08 <--> C2: Cool label`},
 			t.Errorf("Render() invalid svg")
 		}
 	})
-
 
 	for _, tt := range cases {
 		t.Run("", func(t *testing.T) {
@@ -371,4 +375,181 @@ func BenchmarkRenderEngine_Render(b *testing.B) {
 		_, _ = re1.Render(case1)
 	}
 	re1.Cancel()
+}
+
+func TestRenderEngine_RenderTimeout(t *testing.T) {
+	// No deadline on the engine: each render carries its own. Without a
+	// deadline chromedp's 20s default dial budget applies, which a loaded
+	// machine can exceed, so ask for a generous one explicitly.
+	re, err := NewRenderEngine(context.Background(), nil, chromedp.WSURLReadTimeout(renderTimeout))
+	if err != nil {
+		t.Fatalf("NewRenderEngine() error = %v", err)
+	}
+	defer re.Cancel()
+
+	content := "graph TD; A-->B;"
+
+	t.Run("PerCallTimeout", func(t *testing.T) {
+		if _, err := re.Render(content, WithTimeout(time.Nanosecond)); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Render() expected context.DeadlineExceeded, got %v", err)
+		}
+		if _, _, err := re.RenderAsPng(content, WithTimeout(time.Nanosecond)); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("RenderAsPng() expected context.DeadlineExceeded, got %v", err)
+		}
+		if _, _, err := re.RenderAsScaledPng(content, 2.0, WithTimeout(time.Nanosecond)); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("RenderAsScaledPng() expected context.DeadlineExceeded, got %v", err)
+		}
+	})
+
+	t.Run("EngineSurvivesTimeout", func(t *testing.T) {
+		svg, err := re.Render(content)
+		if err != nil {
+			t.Fatalf("Render() after a timed out render error = %v", err)
+		}
+		if !strings.HasPrefix(svg, "<svg") {
+			t.Errorf("Render() got an invalid svg = %v", svg)
+		}
+	})
+
+	t.Run("EngineTimeout", func(t *testing.T) {
+		re.SetRenderTimeout(time.Nanosecond)
+		if _, err := re.Render(content); !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("Render() expected context.DeadlineExceeded, got %v", err)
+		}
+		// A per-call option still wins over the engine default.
+		if _, err := re.Render(content, WithTimeout(renderTimeout)); err != nil {
+			t.Errorf("Render() with a per-call timeout error = %v", err)
+		}
+		re.SetRenderTimeout(DefaultRenderTimeout)
+	})
+
+	t.Run("DisabledTimeout", func(t *testing.T) {
+		re.SetRenderTimeout(0)
+		defer re.SetRenderTimeout(DefaultRenderTimeout)
+		if _, err := re.Render(content, WithTimeout(0)); err != nil {
+			t.Errorf("Render() with the deadline disabled error = %v", err)
+		}
+	})
+}
+
+func TestRenderEngine_TargetCrashed(t *testing.T) {
+	// The crash bookkeeping is driven purely by Inspector events, so it can be
+	// exercised without a browser.
+	re := &RenderEngine{}
+
+	var reported []error
+	re.SetTargetCrashedHandler(func(err error) { reported = append(reported, err) })
+
+	if err := re.CrashError(); err != nil {
+		t.Errorf("CrashError() on a healthy engine = %v, want nil", err)
+	}
+
+	for _, reason := range []inspector.DetachReason{inspector.DetachReasonTargetClosed, inspector.DetachReasonCanceledByUser} {
+		re.handleTargetEvent(&inspector.EventDetached{Reason: reason})
+		if err := re.CrashError(); err != nil {
+			t.Errorf("CrashError() after a %q detach = %v, want nil", reason, err)
+		}
+	}
+
+	re.handleTargetEvent(&inspector.EventTargetCrashed{})
+	err := re.CrashError()
+	if !errors.Is(err, ErrTargetCrashed) {
+		t.Fatalf("CrashError() after a crash = %v, want ErrTargetCrashed", err)
+	}
+	if len(reported) != 1 {
+		t.Fatalf("handler called %d times, want 1", len(reported))
+	}
+
+	// A repeated event carries nothing new, so it must not be reported again.
+	re.handleTargetEvent(&inspector.EventTargetCrashed{})
+	if len(reported) != 1 {
+		t.Errorf("handler called %d times for a duplicate crash, want 1", len(reported))
+	}
+
+	// The detach that follows a crash carries the reason chrome gives.
+	re.handleTargetEvent(&inspector.EventDetached{Reason: inspector.DetachReasonRenderProcessGone})
+	err = re.CrashError()
+	if !errors.Is(err, ErrTargetCrashed) {
+		t.Fatalf("CrashError() after a crash detach = %v, want ErrTargetCrashed", err)
+	}
+	if !strings.Contains(err.Error(), inspector.DetachReasonRenderProcessGone.String()) {
+		t.Errorf("CrashError() = %q, want it to mention %q", err, inspector.DetachReasonRenderProcessGone)
+	}
+	if len(reported) != 2 {
+		t.Fatalf("handler called %d times, want 2", len(reported))
+	}
+	if !errors.Is(reported[1], ErrTargetCrashed) || !strings.Contains(reported[1].Error(), inspector.DetachReasonRenderProcessGone.String()) {
+		t.Errorf("handler got %v, want a crash error mentioning the detach reason", reported[1])
+	}
+
+	// Render errors are annotated so callers can tell a dead browser apart
+	// from a slow diagram.
+	annotated := re.annotateCrash(context.DeadlineExceeded)
+	if !errors.Is(annotated, context.DeadlineExceeded) || !errors.Is(annotated, ErrTargetCrashed) {
+		t.Errorf("annotateCrash() = %v, want both the original and the crash error", annotated)
+	}
+	if re.annotateCrash(nil) != nil {
+		t.Error("annotateCrash(nil) expected nil")
+	}
+
+	// Chrome can bring the target back; the engine must not stay poisoned.
+	re.handleTargetEvent(&inspector.EventTargetReloadedAfterCrash{})
+	if err := re.CrashError(); err != nil {
+		t.Errorf("CrashError() after a reload = %v, want nil", err)
+	}
+	if got := re.annotateCrash(context.DeadlineExceeded); !errors.Is(got, context.DeadlineExceeded) || errors.Is(got, ErrTargetCrashed) {
+		t.Errorf("annotateCrash() after a reload = %v, want the original error only", got)
+	}
+
+	re.SetTargetCrashedHandler(nil)
+	re.handleTargetEvent(&inspector.EventTargetCrashed{})
+	if len(reported) != 2 {
+		t.Errorf("handler called %d times after being removed, want 2", len(reported))
+	}
+}
+
+func TestRenderEngine_TargetCrashedLive(t *testing.T) {
+	re, err := NewRenderEngine(context.Background(), nil, chromedp.WSURLReadTimeout(renderTimeout))
+	if err != nil {
+		t.Fatalf("NewRenderEngine() error = %v", err)
+	}
+	defer re.Cancel()
+
+	crashed := make(chan error, 4)
+	re.SetTargetCrashedHandler(func(err error) {
+		select {
+		case crashed <- err:
+		default:
+		}
+	})
+
+	// chrome://crash kills the renderer on purpose, which is the closest we get
+	// to a reproducible Inspector.targetCrashed.
+	navCtx, navCancel := context.WithTimeout(re.ctx, 10*time.Second)
+	defer navCancel()
+	if err := chromedp.Run(navCtx, chromedp.Navigate("chrome://crash")); err != nil {
+		t.Logf("navigating to chrome://crash returned %v (expected)", err)
+	}
+
+	select {
+	case err := <-crashed:
+		if !errors.Is(err, ErrTargetCrashed) {
+			t.Errorf("handler got %v, want ErrTargetCrashed", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("chrome did not report a crash within 15s")
+	}
+
+	if err := re.CrashError(); !errors.Is(err, ErrTargetCrashed) {
+		t.Errorf("CrashError() = %v, want ErrTargetCrashed", err)
+	}
+
+	// A render against the dead target must fail promptly and say why.
+	_, err = re.Render("graph TD; A-->B;", WithTimeout(10*time.Second))
+	if err == nil {
+		t.Fatal("Render() on a crashed target expected an error, got nil")
+	}
+	if !errors.Is(err, ErrTargetCrashed) {
+		t.Errorf("Render() error = %v, want it to wrap ErrTargetCrashed", err)
+	}
 }
