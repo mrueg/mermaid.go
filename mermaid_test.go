@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/chromedp/cdproto/inspector"
+	"github.com/chromedp/cdproto/page"
 	"github.com/chromedp/chromedp"
 )
 
@@ -523,12 +524,15 @@ func TestRenderEngine_TargetCrashedLive(t *testing.T) {
 		}
 	})
 
-	// chrome://crash kills the renderer on purpose, which is the closest we get
-	// to a reproducible Inspector.targetCrashed.
-	navCtx, navCancel := context.WithTimeout(re.ctx, 10*time.Second)
-	defer navCancel()
-	if err := chromedp.Run(navCtx, chromedp.Navigate("chrome://crash")); err != nil {
-		t.Logf("navigating to chrome://crash returned %v (expected)", err)
+	// Page.crash is the documented way to kill the renderer on purpose. It is
+	// far more portable than navigating to chrome://crash, whose handling
+	// varies between builds. The command itself never gets a reply, since the
+	// renderer it is addressed to is gone, so the deadline here is the success
+	// path rather than a failure.
+	crashCtx, crashCancel := context.WithTimeout(re.ctx, 10*time.Second)
+	defer crashCancel()
+	if err := chromedp.Run(crashCtx, chromedp.ActionFunc(page.Crash().Do)); err != nil {
+		t.Logf("Page.crash returned %v (expected)", err)
 	}
 
 	select {
