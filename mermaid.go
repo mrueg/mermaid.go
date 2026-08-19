@@ -30,6 +30,13 @@ var DefaultPage = `data:text/html,<!DOCTYPE html>
 // block forever, because the engine context has no deadline of its own.
 const DefaultRenderTimeout = 30 * time.Second
 
+// DefaultStartupTimeout bounds loading mermaid.js and running the caller's
+// statements in NewRenderEngine when the supplied context has no deadline of its
+// own. WSURLReadTimeout only covers reading the DevTools URL from chrome's
+// stderr, so without this the evaluation of the embedded 3.5MB bundle could hang
+// indefinitely. Pass a context with a deadline to choose a different bound.
+const DefaultStartupTimeout = 60 * time.Second
+
 var (
 	ErrMermaidNotReady = errors.New("mermaid.js initial failed")
 	ErrFailedEncoding  = errors.New("failed to encode")
@@ -38,21 +45,35 @@ var (
 	// against a crashed target fail with this error joined to the underlying
 	// chromedp error.
 	ErrTargetCrashed = errors.New("chrome target crashed")
+	// ErrRenderException reports that the page raised a JavaScript exception,
+	// which for a render almost always means the diagram source is invalid.
+	// It is worth separating from the transport and lifecycle failures: retrying
+	// it will fail identically, whereas retrying ErrTargetCrashed or a timeout
+	// may well succeed. The *runtime.ExceptionDetails chrome supplied stays
+	// reachable with errors.As for the script location and stack.
+	ErrRenderException = errors.New("render raised a javascript exception")
+	// ErrUnsupportedOption reports a RenderOption that the called method cannot
+	// honour, rather than ignoring it. WithBundle is the only such option: it
+	// embeds the source in the SVG's <desc>, which a PNG has nowhere to put.
+	ErrUnsupportedOption = errors.New("unsupported render option")
 )
 
 type BoxModel = dom.BoxModel
 
 type RenderEngine struct {
-	mu              sync.Mutex
+	// sem serialises renders. It is a one-slot channel rather than a mutex so
+	// that waiting for a turn can be abandoned when the caller's context is
+	// cancelled; sync.Mutex offers no such thing.
+	sem             chan struct{}
 	ctx             context.Context
 	cancel          context.CancelFunc
 	allocatorCancel context.CancelFunc
-	// renderTimeout is atomic so it can be adjusted while a render holds mu.
+	// renderTimeout is atomic so it can be adjusted while a render is running.
 	renderTimeout atomic.Int64
 
 	// crashMu guards the crash bookkeeping below. It is deliberately separate
-	// from mu: the chromedp event goroutine takes it while a Render call may be
-	// holding mu, and taking mu from the event goroutine would deadlock.
+	// from sem: the chromedp event goroutine takes it while a render is in
+	// flight, and making that goroutine wait for a render would deadlock.
 	crashMu      sync.Mutex
 	crashed      bool
 	detachReason string
@@ -83,6 +104,7 @@ func NewRenderEngine(ctx context.Context, statements []string, options ...chrome
 	ctx, cancel := chromedp.NewContext(actx)
 
 	engine := &RenderEngine{
+		sem:             make(chan struct{}, 1),
 		ctx:             ctx,
 		cancel:          cancel,
 		allocatorCancel: allocatorCancel,
@@ -102,9 +124,26 @@ func NewRenderEngine(ctx context.Context, statements []string, options ...chrome
 		actions = append(actions, chromedp.Evaluate(stmt, nil))
 	}
 	actions = append(actions, chromedp.Evaluate("typeof mermaid", &result))
-	err := chromedp.Run(ctx, actions...)
+
+	// Allocate the browser against the engine context before bounding anything.
+	// chromedp starts chrome with exec.CommandContext using whichever context
+	// reaches the first Run, so running the initialisation under a derived
+	// deadline would tie chrome's lifetime to that deadline and kill it the
+	// moment this function returned.
+	err := chromedp.Run(ctx)
+	if err == nil {
+		startCtx := ctx
+		if _, ok := ctx.Deadline(); !ok {
+			var startCancel context.CancelFunc
+			startCtx, startCancel = context.WithTimeout(ctx, DefaultStartupTimeout)
+			defer startCancel()
+		}
+		err = chromedp.Run(startCtx, actions...)
+	}
 	if err == nil && result != "object" {
-		err = ErrMermaidNotReady
+		// The value is the whole diagnostic: "undefined" means the bundle never
+		// defined mermaid, anything else means it was replaced.
+		err = fmt.Errorf("%w: typeof mermaid = %q", ErrMermaidNotReady, result)
 	}
 	if err != nil {
 		cancel()
@@ -219,25 +258,89 @@ func WithTimeout(d time.Duration) RenderOption {
 	}
 }
 
-// renderContext derives the context for one render. Cancelling a context
-// derived from the engine context only aborts the in-flight commands, so the
-// engine stays usable after a timeout.
-func (r *RenderEngine) renderContext(opts *renderOptions) (context.Context, context.CancelFunc) {
+// acquire waits for this render's turn, giving up if the caller's context is
+// cancelled or the engine is closed. Without it a caller could sit behind an
+// unbounded queue of other renders with no way out, because the per-render
+// deadline only starts once a render actually begins.
+func (r *RenderEngine) acquire(ctx context.Context) (release func(), err error) {
+	if err := ctx.Err(); err != nil {
+		return nil, r.renderErr(ctx, err)
+	}
+	select {
+	case r.sem <- struct{}{}:
+		return func() { <-r.sem }, nil
+	case <-ctx.Done():
+		return nil, r.renderErr(ctx, ctx.Err())
+	case <-r.ctx.Done():
+		return nil, r.annotateCrash(r.ctx.Err())
+	}
+}
+
+// renderErr classifies a failed render. When the caller's context is what ended
+// it, the derived context reports a bare Canceled; the caller's own cause says
+// why, so prefer it.
+func (r *RenderEngine) renderErr(caller context.Context, err error) error {
+	if errors.Is(err, context.Canceled) {
+		if cause := context.Cause(caller); cause != nil {
+			err = cause
+		}
+	}
+	return r.annotateCrash(err)
+}
+
+// renderContext derives the context for one render. It is rooted at the engine
+// context because that is what carries chromedp's target; the caller's context
+// contributes its deadline and its cancellation, but not its values.
+//
+// Cancelling a context derived from the engine context only aborts the in-flight
+// commands, so the engine stays usable after a timeout. This is not true of the
+// very first Run against a fresh engine, which is why NewRenderEngine allocates
+// the browser separately -- see the comment there.
+func (r *RenderEngine) renderContext(caller context.Context, opts *renderOptions) (context.Context, context.CancelFunc) {
 	timeout := time.Duration(r.renderTimeout.Load())
 	if opts.hasTimeout {
 		timeout = opts.timeout
 	}
-	if timeout <= 0 {
-		return r.ctx, func() {}
+
+	var (
+		ctx    context.Context
+		cancel context.CancelFunc
+	)
+	// Honour whichever of the two deadlines lands first, so a caller asking for
+	// less than the engine's timeout gets a truthful DeadlineExceeded rather
+	// than the bare Canceled that propagation alone would produce.
+	deadline, hasDeadline := caller.Deadline()
+	switch {
+	case timeout > 0 && hasDeadline && time.Now().Add(timeout).Before(deadline):
+		ctx, cancel = context.WithTimeout(r.ctx, timeout)
+	case hasDeadline:
+		ctx, cancel = context.WithDeadline(r.ctx, deadline)
+	case timeout > 0:
+		ctx, cancel = context.WithTimeout(r.ctx, timeout)
+	default:
+		ctx, cancel = context.WithCancel(r.ctx)
 	}
-	return context.WithTimeout(r.ctx, timeout)
+
+	stop := context.AfterFunc(caller, cancel)
+	return ctx, func() {
+		stop()
+		cancel()
+	}
 }
 
-// annotateCrash joins the crash error to err so callers can tell a timeout
-// caused by a dead browser apart from a slow diagram.
+// annotateCrash classifies a render failure so callers can act on it without
+// matching on error strings: it joins the crash error when the browser has died,
+// and tags a JavaScript exception so an invalid diagram is distinguishable from
+// an infrastructure failure.
 func (r *RenderEngine) annotateCrash(err error) error {
 	if err == nil {
 		return nil
+	}
+	// chromedp returns *runtime.ExceptionDetails as the error itself, which is
+	// discoverable only if you already know to look for it.
+	var exception *runtime.ExceptionDetails
+	if errors.As(err, &exception) {
+		err = fmt.Errorf("%w: %w", ErrRenderException, err)
 	}
 	if crashErr := r.CrashError(); crashErr != nil {
 		return errors.Join(err, crashErr)
@@ -245,10 +348,19 @@ func (r *RenderEngine) annotateCrash(err error) error {
 	return err
 }
 
+// Render renders content to SVG. It is equivalent to RenderContext with a
+// background context, so it cannot be cancelled by the caller and is bounded
+// only by the engine's render timeout.
 func (r *RenderEngine) Render(content string, opts ...RenderOption) (string, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	return r.RenderContext(context.Background(), content, opts...)
+}
 
+// RenderContext renders content to SVG, giving up if ctx is cancelled. The
+// context covers the wait for other renders to finish as well as the render
+// itself, and its deadline applies if it is sooner than the engine's render
+// timeout. Only cancellation and the deadline are taken from ctx; its values are
+// not, because the render has to run on chromedp's own context.
+func (r *RenderEngine) RenderContext(ctx context.Context, content string, opts ...RenderOption) (string, error) {
 	var (
 		result string
 	)
@@ -260,8 +372,14 @@ func (r *RenderEngine) Render(content string, opts ...RenderOption) (string, err
 
 	encodedContent, err := jsonMarshal(content)
 	if err != nil {
-		return "", ErrFailedEncoding
+		return "", fmt.Errorf("%w: %w", ErrFailedEncoding, err)
 	}
+
+	release, err := r.acquire(ctx)
+	if err != nil {
+		return "", err
+	}
+	defer release()
 
 	var script string
 	if renderOpts.bundle {
@@ -278,21 +396,31 @@ func (r *RenderEngine) Render(content string, opts ...RenderOption) (string, err
 		script = fmt.Sprintf("document.body.innerHTML = ''; mermaid.render('mermaid', %s).then(({ svg }) => { return svg; });", string(encodedContent))
 	}
 
-	ctx, cancel := r.renderContext(renderOpts)
+	runCtx, cancel := r.renderContext(ctx, renderOpts)
 	defer cancel()
 
-	err = chromedp.Run(ctx,
+	err = chromedp.Run(runCtx,
 		chromedp.Evaluate(script, &result, func(p *runtime.EvaluateParams) *runtime.EvaluateParams {
 			return p.WithAwaitPromise(true)
 		}),
 	)
-	return result, r.annotateCrash(err)
+	if err != nil {
+		return "", r.renderErr(ctx, err)
+	}
+	return result, nil
 }
 
+// RenderAsScaledPng renders content to a PNG at the given scale. It is
+// equivalent to RenderAsScaledPngContext with a background context.
 func (r *RenderEngine) RenderAsScaledPng(content string, scale float64, opts ...RenderOption) ([]byte, *BoxModel, error) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
+	return r.RenderAsScaledPngContext(context.Background(), content, scale, opts...)
+}
 
+// RenderAsScaledPngContext renders content to a PNG at the given scale, giving
+// up if ctx is cancelled. See RenderContext for how ctx is applied. On failure
+// it returns no image and no box model, so a caller cannot mistake a partial
+// screenshot for a complete one.
+func (r *RenderEngine) RenderAsScaledPngContext(ctx context.Context, content string, scale float64, opts ...RenderOption) ([]byte, *BoxModel, error) {
 	var (
 		result_in_bytes []byte
 		model           *dom.BoxModel
@@ -302,33 +430,54 @@ func (r *RenderEngine) RenderAsScaledPng(content string, scale float64, opts ...
 	for _, opt := range opts {
 		opt(renderOpts)
 	}
+	if renderOpts.bundle {
+		return nil, nil, fmt.Errorf("%w: WithBundle has no effect on a PNG, the source is embedded in the SVG's <desc>", ErrUnsupportedOption)
+	}
 
 	encodedContent, err := jsonMarshal(content)
 	if err != nil {
-		return nil, nil, ErrFailedEncoding
+		return nil, nil, fmt.Errorf("%w: %w", ErrFailedEncoding, err)
 	}
 	script := fmt.Sprintf("document.body.innerHTML = ''; mermaid.render('mermaid', %s).then(({ svg }) => { document.body.innerHTML = svg; });", string(encodedContent))
 
-	ctx, cancel := r.renderContext(renderOpts)
+	release, err := r.acquire(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	defer release()
+
+	runCtx, cancel := r.renderContext(ctx, renderOpts)
 	defer cancel()
 
-	err = chromedp.Run(ctx,
+	err = chromedp.Run(runCtx,
 		chromedp.Evaluate(script, nil, func(p *runtime.EvaluateParams) *runtime.EvaluateParams {
 			return p.WithAwaitPromise(true)
 		}),
 		chromedp.ScreenshotScale("#mermaid", scale, &result_in_bytes, chromedp.ByID),
 		chromedp.Dimensions("#mermaid", &model, chromedp.ByID),
 	)
-	return result_in_bytes, model, r.annotateCrash(err)
+	if err != nil {
+		return nil, nil, r.renderErr(ctx, err)
+	}
+	return result_in_bytes, model, nil
 }
 
+// RenderAsPng renders content to a PNG. It is equivalent to
+// RenderAsPngContext with a background context.
 func (r *RenderEngine) RenderAsPng(content string, opts ...RenderOption) ([]byte, *BoxModel, error) {
-	return r.RenderAsScaledPng(content, 1.0, opts...)
+	return r.RenderAsScaledPngContext(context.Background(), content, 1.0, opts...)
 }
 
+// RenderAsPngContext renders content to a PNG, giving up if ctx is cancelled.
+func (r *RenderEngine) RenderAsPngContext(ctx context.Context, content string, opts ...RenderOption) ([]byte, *BoxModel, error) {
+	return r.RenderAsScaledPngContext(ctx, content, 1.0, opts...)
+}
+
+// Cancel closes the browser and releases every resource held by the engine. It
+// deliberately does not wait for an in-flight render: context.CancelFunc is safe
+// for concurrent use, so cancelling straight away aborts a render in progress
+// instead of queueing behind it. Calling it more than once is harmless.
 func (r *RenderEngine) Cancel() {
-	r.mu.Lock()
-	defer r.mu.Unlock()
 	r.cancel()
 	if r.allocatorCancel != nil {
 		r.allocatorCancel()

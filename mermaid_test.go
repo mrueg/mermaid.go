@@ -12,6 +12,7 @@ import (
 
 	"github.com/chromedp/cdproto/inspector"
 	"github.com/chromedp/cdproto/page"
+	"github.com/chromedp/cdproto/runtime"
 	"github.com/chromedp/chromedp"
 )
 
@@ -22,7 +23,7 @@ var renderTimeout = 60 * time.Second
 func TestRenderEngine_Render(t *testing.T) {
 	cases := []struct {
 		content/*, result */ string
-		err_has_prefix string
+		wantException bool
 	}{
 		{content: `graph TD;
     A-->B;
@@ -98,7 +99,7 @@ Class08 <--> C2: Cool label`},
     C-->D;`},
 		{content: `graph TD;
     A-->B['name'];
-    A-->;`, err_has_prefix: `exception "Uncaught`},
+    A-->;`, wantException: true},
 		{content: `graph TD;
 	A-->B["` + "`Hello World`" + `"];
 	B-->C;`},
@@ -334,11 +335,18 @@ Class08 <--> C2: Cool label`},
 		t.Run("", func(t *testing.T) {
 			got, err := re1.Render(tt.content)
 			t.Logf("got %s, error %s", got, err)
-			if err != nil {
-				if tt.err_has_prefix != "" && strings.HasPrefix(err.Error(), tt.err_has_prefix) {
-					// expected exception
-					return
+			if tt.wantException {
+				// Classified rather than matched on the message, so the
+				// assertion survives a reworded chrome exception.
+				if !errors.Is(err, ErrRenderException) {
+					t.Errorf("Render() error = %v, want ErrRenderException", err)
 				}
+				if _, _, err := re1.RenderAsPng(tt.content); !errors.Is(err, ErrRenderException) {
+					t.Errorf("RenderAsPng() error = %v, want ErrRenderException", err)
+				}
+				return
+			}
+			if err != nil {
 				t.Errorf("Render() error = %v", err)
 			}
 			if !strings.HasPrefix(got, "<svg") {
@@ -347,10 +355,7 @@ Class08 <--> C2: Cool label`},
 
 			result_in_bytes, box, err := re1.RenderAsPng(tt.content)
 			if err != nil {
-				if !strings.HasPrefix(err.Error(), tt.err_has_prefix) {
-					t.Errorf("Render() error = %v", err)
-					return
-				}
+				t.Fatalf("RenderAsPng() error = %v", err)
 			}
 			if box == nil {
 				t.Errorf("RenderAsPng() returned an empty box")
@@ -569,4 +574,256 @@ func TestRenderEngine_TargetCrashedLive(t *testing.T) {
 	if !errors.Is(err, ErrTargetCrashed) {
 		t.Errorf("Render() error = %v, want it to wrap ErrTargetCrashed", err)
 	}
+}
+
+func TestRenderEngine_RenderContext(t *testing.T) {
+	re, err := NewRenderEngine(context.Background(), nil, chromedp.WSURLReadTimeout(renderTimeout))
+	if err != nil {
+		t.Fatalf("NewRenderEngine() error = %v", err)
+	}
+	defer re.Cancel()
+
+	content := "graph TD; A-->B;"
+
+	t.Run("Succeeds", func(t *testing.T) {
+		svg, err := re.RenderContext(context.Background(), content)
+		if err != nil {
+			t.Fatalf("RenderContext() error = %v", err)
+		}
+		if !strings.HasPrefix(svg, "<svg") {
+			t.Errorf("RenderContext() got an invalid svg = %v", svg)
+		}
+	})
+
+	t.Run("AlreadyCancelledFailsFast", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if _, err := re.RenderContext(ctx, content); !errors.Is(err, context.Canceled) {
+			t.Errorf("RenderContext() error = %v, want context.Canceled", err)
+		}
+		if _, _, err := re.RenderAsPngContext(ctx, content); !errors.Is(err, context.Canceled) {
+			t.Errorf("RenderAsPngContext() error = %v, want context.Canceled", err)
+		}
+	})
+
+	t.Run("CancelledWhileQueued", func(t *testing.T) {
+		// Occupy the engine so the call has to queue. This is the case a
+		// caller could not escape before: the render timeout only starts once
+		// a render begins, so the wait for a turn was unbounded.
+		re.sem <- struct{}{}
+		defer func() { <-re.sem }()
+
+		ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+		defer cancel()
+
+		start := time.Now()
+		_, err := re.RenderContext(ctx, content)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("RenderContext() error = %v, want context.DeadlineExceeded", err)
+		}
+		if elapsed := time.Since(start); elapsed > 5*time.Second {
+			t.Errorf("RenderContext() waited %v for a turn, want it to give up with the context", elapsed)
+		}
+	})
+
+	t.Run("CancellationCauseIsReported", func(t *testing.T) {
+		re.sem <- struct{}{}
+		defer func() { <-re.sem }()
+
+		reason := errors.New("caller went away")
+		ctx, cancel := context.WithCancelCause(context.Background())
+		cancel(reason)
+
+		if _, err := re.RenderContext(ctx, content); !errors.Is(err, reason) {
+			t.Errorf("RenderContext() error = %v, want it to report the cancellation cause", err)
+		}
+	})
+}
+
+func TestRenderEngine_renderContext(t *testing.T) {
+	// The deadline arithmetic is worth checking directly: it decides whether a
+	// caller sees a truthful DeadlineExceeded or a bare Canceled.
+	re := &RenderEngine{sem: make(chan struct{}, 1), ctx: context.Background()}
+
+	t.Run("CallerDeadlineWinsWhenSooner", func(t *testing.T) {
+		re.SetRenderTimeout(time.Hour)
+		want := time.Now().Add(2 * time.Second)
+		caller, cancel := context.WithDeadline(context.Background(), want)
+		defer cancel()
+
+		ctx, done := re.renderContext(caller, &renderOptions{})
+		defer done()
+
+		got, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("renderContext() produced no deadline")
+		}
+		if got.Sub(want).Abs() > 50*time.Millisecond {
+			t.Errorf("renderContext() deadline = %v, want the caller's %v", got, want)
+		}
+	})
+
+	t.Run("EngineTimeoutWinsWhenSooner", func(t *testing.T) {
+		re.SetRenderTimeout(time.Second)
+		caller, cancel := context.WithTimeout(context.Background(), time.Hour)
+		defer cancel()
+
+		ctx, done := re.renderContext(caller, &renderOptions{})
+		defer done()
+
+		got, ok := ctx.Deadline()
+		if !ok {
+			t.Fatal("renderContext() produced no deadline")
+		}
+		if until := time.Until(got); until > 5*time.Second {
+			t.Errorf("renderContext() deadline is %v away, want the engine's 1s", until)
+		}
+	})
+
+	t.Run("CallerCancellationPropagates", func(t *testing.T) {
+		re.SetRenderTimeout(time.Hour)
+		caller, cancel := context.WithCancel(context.Background())
+
+		ctx, done := re.renderContext(caller, &renderOptions{})
+		defer done()
+
+		cancel()
+		select {
+		case <-ctx.Done():
+		case <-time.After(5 * time.Second):
+			t.Error("renderContext() did not propagate the caller's cancellation")
+		}
+	})
+
+	t.Run("NoDeadlineWhenBothDisabled", func(t *testing.T) {
+		re.SetRenderTimeout(0)
+		ctx, done := re.renderContext(context.Background(), &renderOptions{})
+		defer done()
+		if _, ok := ctx.Deadline(); ok {
+			t.Error("renderContext() set a deadline when both the engine and the caller declined one")
+		}
+	})
+}
+
+func TestRenderEngine_CancelDoesNotWaitForRender(t *testing.T) {
+	re, err := NewRenderEngine(context.Background(), nil, chromedp.WSURLReadTimeout(renderTimeout))
+	if err != nil {
+		t.Fatalf("NewRenderEngine() error = %v", err)
+	}
+
+	// Stand in for a render in flight. Cancel used to take the same lock, so
+	// shutdown queued behind the render it was meant to abort.
+	re.sem <- struct{}{}
+	defer func() { <-re.sem }()
+
+	done := make(chan struct{})
+	go func() {
+		re.Cancel()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Cancel() blocked behind an in-flight render")
+	}
+}
+
+func TestRenderEngine_ErrorClassification(t *testing.T) {
+	re, err := NewRenderEngine(context.Background(), nil, chromedp.WSURLReadTimeout(renderTimeout))
+	if err != nil {
+		t.Fatalf("NewRenderEngine() error = %v", err)
+	}
+	defer re.Cancel()
+
+	t.Run("InvalidDiagramIsAnException", func(t *testing.T) {
+		_, err := re.Render("graph TD; A---;")
+		if !errors.Is(err, ErrRenderException) {
+			t.Fatalf("Render() error = %v, want ErrRenderException", err)
+		}
+		// The chrome detail stays reachable for the script location and stack.
+		var exception *runtime.ExceptionDetails
+		if !errors.As(err, &exception) {
+			t.Errorf("Render() error = %v, want the *runtime.ExceptionDetails to remain reachable", err)
+		}
+		// An invalid diagram is not a browser failure; retrying it is pointless
+		// whereas retrying a crash is not, so the two must not be conflated.
+		if errors.Is(err, ErrTargetCrashed) {
+			t.Errorf("Render() error = %v, should not report a crash", err)
+		}
+	})
+
+	t.Run("NoPartialPngOnFailure", func(t *testing.T) {
+		png, box, err := re.RenderAsPng("graph TD; A---;")
+		if err == nil {
+			t.Fatal("RenderAsPng() expected an error for invalid syntax")
+		}
+		if png != nil || box != nil {
+			t.Errorf("RenderAsPng() returned png=%d bytes, box=%v on failure, want neither", len(png), box)
+		}
+	})
+
+	t.Run("BundleIsRejectedForPng", func(t *testing.T) {
+		// Previously accepted and silently ignored, because the PNG methods take
+		// RenderOptions but only Render implements bundling.
+		if _, _, err := re.RenderAsPng("graph TD; A-->B;", WithBundle()); !errors.Is(err, ErrUnsupportedOption) {
+			t.Errorf("RenderAsPng(WithBundle()) error = %v, want ErrUnsupportedOption", err)
+		}
+		if _, _, err := re.RenderAsScaledPng("graph TD; A-->B;", 2.0, WithBundle()); !errors.Is(err, ErrUnsupportedOption) {
+			t.Errorf("RenderAsScaledPng(WithBundle()) error = %v, want ErrUnsupportedOption", err)
+		}
+	})
+
+	t.Run("EncodingErrorIsWrapped", func(t *testing.T) {
+		oldJSONMarshal := jsonMarshal
+		defer func() { jsonMarshal = oldJSONMarshal }()
+		underlying := errors.New("mock marshal error")
+		jsonMarshal = func(v any) ([]byte, error) { return nil, underlying }
+
+		_, err := re.Render("graph TD; A-->B;")
+		if !errors.Is(err, ErrFailedEncoding) {
+			t.Errorf("Render() error = %v, want ErrFailedEncoding", err)
+		}
+		if !errors.Is(err, underlying) {
+			t.Errorf("Render() error = %v, want the underlying marshal error preserved", err)
+		}
+	})
+}
+
+func TestRenderEngine_StartupDiagnostics(t *testing.T) {
+	t.Run("MermaidNotReadyNamesTheValue", func(t *testing.T) {
+		engine, err := NewRenderEngine(context.Background(), []string{"delete window.mermaid"},
+			chromedp.WSURLReadTimeout(renderTimeout))
+		if !errors.Is(err, ErrMermaidNotReady) {
+			t.Fatalf("NewRenderEngine() error = %v, want ErrMermaidNotReady", err)
+		}
+		if engine != nil {
+			t.Error("NewRenderEngine() expected nil engine on error")
+		}
+		// Knowing what typeof mermaid actually was is the whole diagnostic.
+		if !strings.Contains(err.Error(), `"undefined"`) {
+			t.Errorf("NewRenderEngine() error = %q, want it to name the typeof result", err)
+		}
+	})
+
+	t.Run("StartupDeadlineDoesNotKillChrome", func(t *testing.T) {
+		// chromedp binds chrome's process to the context of the first Run, so
+		// bounding startup with a derived deadline would kill the browser as
+		// soon as NewRenderEngine returned. Renders afterwards prove it did not.
+		re, err := NewRenderEngine(context.Background(), nil, chromedp.WSURLReadTimeout(renderTimeout))
+		if err != nil {
+			t.Fatalf("NewRenderEngine() error = %v", err)
+		}
+		defer re.Cancel()
+
+		for i := range 2 {
+			svg, err := re.Render("graph TD; A-->B;")
+			if err != nil {
+				t.Fatalf("Render() %d after a bounded startup error = %v", i, err)
+			}
+			if !strings.HasPrefix(svg, "<svg") {
+				t.Errorf("Render() %d got an invalid svg = %v", i, svg)
+			}
+		}
+	})
 }
