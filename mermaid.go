@@ -1,3 +1,24 @@
+// Package mermaid_go renders [mermaid.js] diagrams to SVG and PNG from Go.
+//
+// It drives a headless Chrome through [chromedp]. NewRenderEngine launches the
+// browser once and loads the embedded mermaid.js bundle into a page; each render
+// then reuses that page, so the browser is started once rather than per diagram.
+// An engine owns operating system resources and must be released with
+// [RenderEngine.Cancel].
+//
+// Renders are serialised on the engine's single page. Prefer the context-aware
+// methods ([RenderEngine.RenderContext] and friends) in a server: their context
+// bounds the wait for a turn as well as the render itself.
+//
+// Failures are classified with sentinel errors so callers can branch with
+// [errors.Is] rather than on messages, which mainly decides whether a retry is
+// worthwhile: [ErrRenderException] means the diagram is invalid and will fail
+// identically next time, whereas [ErrTargetCrashed] and [context.DeadlineExceeded]
+// may succeed on a retry, and [ErrEngineClosed] means the engine is spent and a
+// new one is needed.
+//
+// [mermaid.js]: https://github.com/mermaid-js/mermaid
+// [chromedp]: https://github.com/chromedp/chromedp
 package mermaid_go
 
 import (
@@ -56,6 +77,13 @@ var (
 	// honour, rather than ignoring it. WithBundle is the only such option: it
 	// embeds the source in the SVG's <desc>, which a PNG has nowhere to put.
 	ErrUnsupportedOption = errors.New("unsupported render option")
+	// ErrEngineClosed reports that the engine's own context is done, because
+	// Cancel was called or the context given to NewRenderEngine was cancelled.
+	// Both that and a cancelled caller otherwise surface as an indistinguishable
+	// context.Canceled, yet they call for opposite responses: a cancelled caller
+	// is routine and the engine is still good, whereas a closed engine will fail
+	// every subsequent render until a new one is built.
+	ErrEngineClosed = errors.New("render engine is closed")
 )
 
 type BoxModel = dom.BoxModel
@@ -117,7 +145,15 @@ func NewRenderEngine(ctx context.Context, statements []string, options ...chrome
 
 	actions := []chromedp.Action{
 		chromedp.Navigate(DefaultPage),
-		chromedp.Evaluate(SourceMermaid, nil),
+		// Evaluate asks for results by value unless handed a
+		// **runtime.RemoteObject, so it would serialise the bundle's completion
+		// value -- some 23KB of object graph -- and ship it over the websocket
+		// only for it to be discarded here. Decline it instead. Overriding the
+		// option is enough because Evaluate applies opts after its own default,
+		// and a nil res is ignored outright.
+		chromedp.Evaluate(SourceMermaid, nil, func(p *runtime.EvaluateParams) *runtime.EvaluateParams {
+			return p.WithReturnByValue(false)
+		}),
 		chromedp.Evaluate("mermaid.initialize({startOnLoad:false})", nil),
 	}
 	for _, stmt := range statements {
@@ -193,8 +229,17 @@ func (r *RenderEngine) noteCrash(reason string) {
 	r.crashMu.Unlock()
 
 	if report {
-		handler(err)
+		reportCrash(handler, err)
 	}
+}
+
+// reportCrash shields chromedp's event goroutine from a panicking handler. The
+// handler runs on a goroutine the consumer does not own and cannot wrap in a
+// recover of their own, so a panic there would take the process down. There is
+// nowhere to report the panic to, so it is swallowed deliberately.
+func reportCrash(handler func(error), err error) {
+	defer func() { _ = recover() }()
+	handler(err)
 }
 
 func (r *RenderEngine) crashErrLocked() error {
@@ -272,7 +317,7 @@ func (r *RenderEngine) acquire(ctx context.Context) (release func(), err error) 
 	case <-ctx.Done():
 		return nil, r.renderErr(ctx, ctx.Err())
 	case <-r.ctx.Done():
-		return nil, r.annotateCrash(r.ctx.Err())
+		return nil, r.renderErr(ctx, r.ctx.Err())
 	}
 }
 
@@ -284,6 +329,11 @@ func (r *RenderEngine) renderErr(caller context.Context, err error) error {
 		if cause := context.Cause(caller); cause != nil {
 			err = cause
 		}
+	}
+	// Say so when the engine itself is what ended the render, since the caller
+	// has to build a new engine rather than simply retry.
+	if r.ctx.Err() != nil {
+		err = fmt.Errorf("%w: %w", ErrEngineClosed, err)
 	}
 	return r.annotateCrash(err)
 }

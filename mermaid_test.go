@@ -376,12 +376,20 @@ func BenchmarkRenderEngine_Render(b *testing.B) {
     A-->C;
     B-->D;
     C-->D;`
-	ctx1 := context.Background()
-	re1, _ := NewRenderEngine(ctx1, nil)
-	for i := 0; i < b.N; i++ {
-		_, _ = re1.Render(case1)
+	// Both errors used to be discarded, so a browser that would not start
+	// panicked on the nil engine, and a failing render was timed as if it had
+	// succeeded.
+	re1, err := NewRenderEngine(context.Background(), nil, chromedp.WSURLReadTimeout(renderTimeout))
+	if err != nil {
+		b.Fatalf("NewRenderEngine() error = %v", err)
 	}
-	re1.Cancel()
+	defer re1.Cancel()
+
+	for b.Loop() {
+		if _, err := re1.Render(case1); err != nil {
+			b.Fatalf("Render() error = %v", err)
+		}
+	}
 }
 
 func TestRenderEngine_RenderTimeout(t *testing.T) {
@@ -826,4 +834,78 @@ func TestRenderEngine_StartupDiagnostics(t *testing.T) {
 			}
 		}
 	})
+}
+
+func TestRenderEngine_ErrEngineClosed(t *testing.T) {
+	re, err := NewRenderEngine(context.Background(), nil, chromedp.WSURLReadTimeout(renderTimeout))
+	if err != nil {
+		t.Fatalf("NewRenderEngine() error = %v", err)
+	}
+
+	// A cancelled caller against a healthy engine is routine: it must not be
+	// reported as the engine being spent.
+	cancelledCtx, cancelCaller := context.WithCancel(context.Background())
+	cancelCaller()
+	if _, err := re.RenderContext(cancelledCtx, "graph TD; A-->B;"); errors.Is(err, ErrEngineClosed) {
+		t.Errorf("RenderContext() with a cancelled caller = %v, should not report ErrEngineClosed", err)
+	}
+
+	re.Cancel()
+
+	// Every entry point must agree once the engine is gone.
+	if _, err := re.Render("graph TD; A-->B;"); !errors.Is(err, ErrEngineClosed) {
+		t.Errorf("Render() after Cancel() = %v, want ErrEngineClosed", err)
+	}
+	if _, err := re.RenderContext(context.Background(), "graph TD; A-->B;"); !errors.Is(err, ErrEngineClosed) {
+		t.Errorf("RenderContext() after Cancel() = %v, want ErrEngineClosed", err)
+	}
+	if _, _, err := re.RenderAsPng("graph TD; A-->B;"); !errors.Is(err, ErrEngineClosed) {
+		t.Errorf("RenderAsPng() after Cancel() = %v, want ErrEngineClosed", err)
+	}
+
+	// The underlying cause stays visible; only the interpretation is added.
+	_, err = re.Render("graph TD; A-->B;")
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("Render() after Cancel() = %v, want the underlying context.Canceled preserved", err)
+	}
+}
+
+func TestRenderEngine_ClosedEngineOutlivesParentContext(t *testing.T) {
+	// Cancelling the context handed to NewRenderEngine kills the engine just as
+	// Cancel does, and must be reported the same way.
+	ctx, cancel := context.WithCancel(context.Background())
+	re, err := NewRenderEngine(ctx, nil, chromedp.WSURLReadTimeout(renderTimeout))
+	if err != nil {
+		t.Fatalf("NewRenderEngine() error = %v", err)
+	}
+	defer re.Cancel()
+
+	cancel()
+	if _, err := re.Render("graph TD; A-->B;"); !errors.Is(err, ErrEngineClosed) {
+		t.Errorf("Render() after the parent context was cancelled = %v, want ErrEngineClosed", err)
+	}
+}
+
+func TestReportCrash_ContainsPanic(t *testing.T) {
+	// The handler runs on chromedp's event goroutine, where a panic would take
+	// the process down with no way for the consumer to recover it.
+	re := &RenderEngine{}
+	re.SetTargetCrashedHandler(func(error) { panic("handler blew up") })
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		re.handleTargetEvent(&inspector.EventTargetCrashed{})
+	}()
+
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("handleTargetEvent did not return")
+	}
+
+	// The crash is still recorded even though the handler misbehaved.
+	if err := re.CrashError(); !errors.Is(err, ErrTargetCrashed) {
+		t.Errorf("CrashError() = %v, want the crash recorded despite the panic", err)
+	}
 }
