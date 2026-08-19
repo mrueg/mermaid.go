@@ -98,7 +98,9 @@ Registers a callback for chrome's `Inspector.targetCrashed` notification (and fo
 unexpected reason, such as `Render process gone.`), so a crashed browser is reported rather than
 observed as a timeout. `fn` receives an error wrapping `ErrTargetCrashed`, annotated with chrome's
 detach reason when one is supplied. It runs on chromedp's event goroutine: it must return promptly
-and must not call back into the engine — hand the error to a logger or a buffered channel.
+and must not call back into the engine — hand the error to a logger or a buffered channel. A panic
+in `fn` is recovered rather than being allowed to take the process down, but it is then discarded,
+so do not rely on it surfacing anywhere.
 Because chrome reports the crash and its reason as separate events, `fn` may be called more than
 once per crash, each time with more detail.
 
@@ -110,7 +112,8 @@ clears if chrome reloads the target after the crash.
 
 ### `Cancel()`
 Closes the underlying browser instance and releases all associated resources. It does not wait for
-an in-flight render: it aborts one, rather than queueing behind it.
+an in-flight render: it aborts one, rather than queueing behind it. Every subsequent render fails
+with `ErrEngineClosed`.
 
 ## Errors
 
@@ -125,6 +128,7 @@ matching on messages — which matters mainly for deciding whether a retry is wo
 | `ErrUnsupportedOption` | A `RenderOption` the called method cannot honour, e.g. `WithBundle()` on a PNG. | No — fix the call |
 | `ErrFailedEncoding` | The diagram source could not be JSON-encoded. Wraps the underlying error. | No |
 | `ErrMermaidNotReady` | `mermaid.js` did not initialise. The message names what `typeof mermaid` actually was. | No |
+| `ErrEngineClosed` | The engine's context is done, because `Cancel()` was called or the context passed to `NewRenderEngine` was cancelled. Without it this is indistinguishable from a cancelled caller, yet it needs the opposite response. | No — build a new engine |
 
 ## Example
 
