@@ -1,6 +1,13 @@
 // Package mermaid_go renders [mermaid.js] diagrams to SVG and PNG from Go.
 //
-// It drives a headless Chrome through [chromedp]. NewRenderEngine launches the
+// Two backends render the same diagrams and satisfy the same [Renderer]
+// interface. NewRenderEngine drives mermaid.js itself in a headless Chrome, and
+// is the reference: whatever mermaid.js can draw, it draws. [NewMermanEngine]
+// instead runs the [merman] CLI, a native reimplementation, which removes the
+// browser dependency entirely at the cost of being a separate implementation of
+// mermaid rather than mermaid itself.
+//
+// The chrome backend drives Chrome through [chromedp]. NewRenderEngine launches the
 // browser once and loads the embedded mermaid.js bundle into a page; each render
 // then reuses that page, so the browser is started once rather than per diagram.
 // An engine owns operating system resources and must be released with
@@ -12,13 +19,14 @@
 //
 // Failures are classified with sentinel errors so callers can branch with
 // [errors.Is] rather than on messages, which mainly decides whether a retry is
-// worthwhile: [ErrRenderException] means the diagram is invalid and will fail
+// worthwhile: [ErrRenderException] means the diagram was rejected and will fail
 // identically next time, whereas [ErrTargetCrashed] and [context.DeadlineExceeded]
 // may succeed on a retry, and [ErrEngineClosed] means the engine is spent and a
 // new one is needed.
 //
 // [mermaid.js]: https://github.com/mermaid-js/mermaid
 // [chromedp]: https://github.com/chromedp/chromedp
+// [merman]: https://github.com/Latias94/merman
 package mermaid_go
 
 import (
@@ -66,13 +74,18 @@ var (
 	// against a crashed target fail with this error joined to the underlying
 	// chromedp error.
 	ErrTargetCrashed = errors.New("chrome target crashed")
-	// ErrRenderException reports that the page raised a JavaScript exception,
-	// which for a render almost always means the diagram source is invalid.
+	// ErrRenderException reports that the backend rejected the diagram source.
 	// It is worth separating from the transport and lifecycle failures: retrying
 	// it will fail identically, whereas retrying ErrTargetCrashed or a timeout
-	// may well succeed. The *runtime.ExceptionDetails chrome supplied stays
-	// reachable with errors.As for the script location and stack.
-	ErrRenderException = errors.New("render raised a javascript exception")
+	// may well succeed.
+	//
+	// Both backends use it, and each keeps its own detail reachable with
+	// errors.As: chrome raises a JavaScript exception and leaves the
+	// *runtime.ExceptionDetails for the script location and stack, while merman
+	// exits 1 and leaves a *MermanExitError. Only chrome's detail is a genuine
+	// exception, and only merman's status is imperfectly exclusive to the
+	// diagram -- see MermanExitError.
+	ErrRenderException = errors.New("render rejected the diagram source")
 	// ErrUnsupportedOption reports a RenderOption that the called method cannot
 	// honour, rather than ignoring it. WithBundle is the only such option: it
 	// embeds the source in the SVG's <desc>, which a PNG has nowhere to put.
@@ -308,74 +321,38 @@ func WithTimeout(d time.Duration) RenderOption {
 // unbounded queue of other renders with no way out, because the per-render
 // deadline only starts once a render actually begins.
 func (r *RenderEngine) acquire(ctx context.Context) (release func(), err error) {
-	if err := ctx.Err(); err != nil {
+	release, err = waitForSlot(ctx, r.ctx, r.sem)
+	if err != nil {
 		return nil, r.renderErr(ctx, err)
 	}
-	select {
-	case r.sem <- struct{}{}:
-		return func() { <-r.sem }, nil
-	case <-ctx.Done():
-		return nil, r.renderErr(ctx, ctx.Err())
-	case <-r.ctx.Done():
-		return nil, r.renderErr(ctx, r.ctx.Err())
-	}
+	return release, nil
 }
 
-// renderErr classifies a failed render. When the caller's context is what ended
-// it, the derived context reports a bare Canceled; the caller's own cause says
-// why, so prefer it.
+// renderErr classifies a failed render: the lifecycle labels every backend
+// applies, plus the crash annotation only chrome can supply.
 func (r *RenderEngine) renderErr(caller context.Context, err error) error {
-	if errors.Is(err, context.Canceled) {
-		if cause := context.Cause(caller); cause != nil {
-			err = cause
-		}
-	}
-	// Say so when the engine itself is what ended the render, since the caller
-	// has to build a new engine rather than simply retry.
-	if r.ctx.Err() != nil {
-		err = fmt.Errorf("%w: %w", ErrEngineClosed, err)
-	}
-	return r.annotateCrash(err)
+	return r.annotateCrash(classifyRenderErr(caller, r.ctx, err))
 }
 
-// renderContext derives the context for one render. It is rooted at the engine
-// context because that is what carries chromedp's target; the caller's context
-// contributes its deadline and its cancellation, but not its values.
+// renderContext derives the context for one render, applying whichever of the
+// engine's timeout, this call's WithTimeout and the caller's deadline lands
+// first. See deriveRenderContext for how the two contexts are combined.
 //
 // Cancelling a context derived from the engine context only aborts the in-flight
 // commands, so the engine stays usable after a timeout. This is not true of the
 // very first Run against a fresh engine, which is why NewRenderEngine allocates
 // the browser separately -- see the comment there.
 func (r *RenderEngine) renderContext(caller context.Context, opts *renderOptions) (context.Context, context.CancelFunc) {
-	timeout := time.Duration(r.renderTimeout.Load())
+	return deriveRenderContext(r.ctx, caller, r.effectiveTimeout(opts))
+}
+
+// effectiveTimeout is the per-render deadline this call asked for, defaulting to
+// the engine's. A value <= 0 means no deadline of our own.
+func (r *RenderEngine) effectiveTimeout(opts *renderOptions) time.Duration {
 	if opts.hasTimeout {
-		timeout = opts.timeout
+		return opts.timeout
 	}
-
-	var (
-		ctx    context.Context
-		cancel context.CancelFunc
-	)
-	// Honour whichever of the two deadlines lands first, so a caller asking for
-	// less than the engine's timeout gets a truthful DeadlineExceeded rather
-	// than the bare Canceled that propagation alone would produce.
-	deadline, hasDeadline := caller.Deadline()
-	switch {
-	case timeout > 0 && hasDeadline && time.Now().Add(timeout).Before(deadline):
-		ctx, cancel = context.WithTimeout(r.ctx, timeout)
-	case hasDeadline:
-		ctx, cancel = context.WithDeadline(r.ctx, deadline)
-	case timeout > 0:
-		ctx, cancel = context.WithTimeout(r.ctx, timeout)
-	default:
-		ctx, cancel = context.WithCancel(r.ctx)
-	}
-
-	stop := context.AfterFunc(caller, cancel)
-	return ctx, func() {
-		stop()
-		cancel()
-	}
+	return time.Duration(r.renderTimeout.Load())
 }
 
 // annotateCrash classifies a render failure so callers can act on it without

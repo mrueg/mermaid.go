@@ -32,7 +32,7 @@ jobs:
 
   ci-unit-tests:
     name: ci-unit-tests
-    runs-on: ubuntu-22.04
+    runs-on: ubuntu-latest
     steps:
     - name: Check out code into the Go module directory
       uses: actions/checkout@v7
@@ -47,9 +47,38 @@ jobs:
       uses: browser-actions/setup-chrome@v2
       with:
         chrome-version: stable
-      
+
+    - name: Allow Chrome's sandbox (AppArmor restricts unprivileged userns on newer images)
+      run: sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+
+    # The merman backend renders through this binary. Without it the tests that
+    # exercise a real merman skip, and only the fake-binary tests run.
+    #
+    # Pinned to the 0.8 prerelease rather than 0.7.0, the current stable: 0.8 is
+    # the generation that answers `capabilities --json`, so the engine's probe is
+    # exercised on its real path here. The fallback 0.7.0 takes is covered by the
+    # scripted binary in the tests.
+    - name: Install merman-cli
+      env:
+        MERMAN_VERSION: v0.8.0-alpha.6
+        MERMAN_TARGET: x86_64-unknown-linux-gnu
+      run: |
+        set -euo pipefail
+        workdir="$(mktemp -d)"
+        cd "$workdir"
+        tarball="merman-cli-${MERMAN_TARGET}.tar.xz"
+        base="https://github.com/Latias94/merman/releases/download/${MERMAN_VERSION}"
+        curl -fsSLO "${base}/${tarball}"
+        curl -fsSLO "${base}/${tarball}.sha256"
+        sha256sum -c "${tarball}.sha256"
+        tar -xJf "${tarball}"
+        mkdir -p "$HOME/.local/bin"
+        install -m755 "merman-cli-${MERMAN_TARGET}/merman-cli" "$HOME/.local/bin/merman-cli"
+        echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+        rm -rf "$workdir"
+
     - name: Run unit tests
-      run:  go test ./...
+      run:  go test -v ./...
 
   ci-build-example:
     name: ci-build-example
